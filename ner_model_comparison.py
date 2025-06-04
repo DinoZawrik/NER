@@ -1,3 +1,5 @@
+import sys
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,12 +12,74 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple
 
+# Добавляем путь к site-packages текущего окружения Conda
+# Это может быть необходимо, если Python не находит установленные пакеты
+conda_env_path = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'site-packages')
+if conda_env_path not in sys.path:
+    sys.path.insert(0, conda_env_path)
+
 # Импорты для CRF и трансформеров будут добавлены позже
-# from sklearn_crfsuite import CRF
-# from transformers import AutoModelForTokenClassification, AutoTokenizer, Trainer, TrainingArguments
+# Импорты для CRF и трансформеров будут добавлены позже
+# import sklearn_crfsuite
+# import nltk
+# # nltk.download('punkt')
+# # nltk.download('averaged_perceptron_tagger')
+
 # Для CRF слоя будем использовать готовую реализацию
 # Убедитесь, что у вас установлена библиотека torchcrf: pip install torchcrf
-from torchcrf import CRF
+from TorchCRF import CRF
+
+# def word2features(sent, i):
+#     word = sent['tokens'][i]
+#     postag = nltk.pos_tag([word])[0][1]
+
+#     features = {
+#         'bias': 1.0,
+#         'word.lower()': word.lower(),
+#         'word[-3:]': word[-3:],
+#         'word[-2:]': word[-2:],
+#         'word.isupper()': word.isupper(),
+#         'word.istitle()': word.istitle(),
+#         'word.isdigit()': word.isdigit(),
+#         'postag': postag,
+#         'postag[:2]': postag[:2],
+#     }
+#     if i > 0:
+#         word1 = sent['tokens'][i-1]
+#         postag1 = nltk.pos_tag([word1])[0][1]
+#         features.update({
+#             '-1:word.lower()': word1.lower(),
+#             '-1:word.istitle()': word1.istitle(),
+#             '-1:word.isupper()': word1.isupper(),
+#             '-1:postag': postag1,
+#             '-1:postag[:2]': postag1[:2],
+#         })
+#     else:
+#         features['BOS'] = True
+
+#     if i < len(sent['tokens'])-1:
+#         word1 = sent['tokens'][i+1]
+#         postag1 = nltk.pos_tag([word1])[0][1]
+#         features.update({
+#             '+1:word.lower()': word1.lower(),
+#             '+1:word.istitle()': word1.istitle(),
+#             '+1:word.isupper()': word1.isupper(),
+#             '+1:postag': postag1,
+#             '+1:postag[:2]': postag1[:2],
+#         })
+#     else:
+#         features['EOS'] = True
+
+#     return features
+
+# def sent2features(sent):
+#     return [word2features(sent, i) for i in range(len(sent['tokens']))]
+
+# def sent2labels(sent):
+#     return [tag for tag in sent['ner_tags']]
+
+# def sent2tokens(sent):
+#     return [token for token in sent['tokens']]
 
 # --- Конфигурация ---
 TRAIN_FILE = 'data/eng.train'
@@ -120,7 +184,7 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Te
     tokens_padded = pad_sequence(tokens, batch_first=True, padding_value=token_to_id[PAD_TOKEN])
     tags_padded = pad_sequence(tags, batch_first=True, padding_value=PAD_TAG_ID)
     # Создаем маску для игнорирования padding при расчете потерь и в CRF
-    attention_mask = (tokens_padded != token_to_id[PAD_TOKEN]).long()
+    attention_mask = (tokens_padded != token_to_id[PAD_TOKEN]).bool()
     return tokens_padded, tags_padded, attention_mask
 
 # --- Определение модели Bi-LSTM-CRF ---
@@ -142,7 +206,7 @@ class BiLSTM_CRF(nn.Module):
         self.hidden2tag = nn.Linear(hidden_dim, num_tags)
 
         # CRF слой
-        self.crf = CRF(num_tags, batch_first=True)
+        self.crf = CRF(num_tags)
 
     def _get_lstm_features(self, sentence: torch.Tensor) -> torch.Tensor:
         """Получает выходные признаки из Bi-LSTM."""
@@ -167,8 +231,87 @@ class BiLSTM_CRF(nn.Module):
         # CRF слой принимает логиты (выходы LSTM) и истинные теги для расчета потерь
         # mask=mask указывает CRF слою игнорировать padding
         # reduction='mean' усредняет потери по батчу
-        loss = -self.crf(lstm_features, tags, mask=mask, reduction='mean')
+        loss = -self.crf(lstm_features, tags, mask=mask)
         return loss
+
+    def _viterbi_decode_manual(self, feats: torch.Tensor, mask: torch.Tensor) -> List[List[int]]:
+        """
+        Ручная реализация алгоритма Витерби для декодирования последовательности тегов.
+        Args:
+            feats: Тензор с логитами из LSTM (batch_size, seq_len, num_tags)
+            mask: Булева маска для игнорирования padding (batch_size, seq_len)
+        Returns:
+            Список списков с предсказанными ID тегов для каждого предложения в батче.
+        """
+        batch_size, seq_len, num_tags = feats.shape
+        decoded_paths = []
+
+        # Переводим тензоры на CPU для обработки
+        feats = feats.cpu()
+        mask = mask.cpu()
+
+        for i in range(batch_size):
+            sentence_feats = feats[i, mask[i]] # Получаем признаки только для реальных токенов
+            sentence_len = sentence_feats.shape[0]
+
+            if sentence_len == 0:
+                decoded_paths.append([])
+                continue
+
+            # Инициализация
+            # viterbi_scores[t][j] = max score of a path ending at tag j at step t
+            viterbi_scores = torch.full((sentence_len, num_tags), -1e10)
+            # backpointers[t][j] = tag that preceded tag j at step t to get max score
+            backpointers = torch.full((sentence_len, num_tags), -1, dtype=torch.long)
+
+            # Начальные скоры (для первого токена)
+            # Переходы из "START" состояния к первому тегу
+            start_transitions = self.crf.state_dict()['start_trans']
+            viterbi_scores[0] = sentence_feats[0] + start_transitions # start_transitions - это параметры CRF
+
+            # Прямой проход (Forward Pass)
+            for t in range(1, sentence_len):
+                # score_t[j] = max score of a path ending at tag j at step t
+                # for each tag j, we consider all possible previous tags k
+                # score_t[j] = max_k (viterbi_scores[t-1][k] + transitions[k][j] + emission_score[t][j])
+                
+                # Расширяем viterbi_scores[t-1] для broadcast
+                prev_scores = viterbi_scores[t-1].unsqueeze(1) # (num_tags, 1)
+                # Расширяем emission_score[t] для broadcast
+                emission_score = sentence_feats[t].unsqueeze(0) # (1, num_tags)
+
+                # transitions[k][j] - переход из k в j
+                # self.crf.transitions - это матрица (num_tags, num_tags)
+                # prev_scores + self.crf.transitions + emission_score
+                # (num_tags, 1) + (num_tags, num_tags) + (1, num_tags)
+                # = (num_tags, num_tags)
+                
+                # Вычисляем скоры для всех возможных предыдущих тегов
+                transitions = self.crf.state_dict()['trans_matrix']
+                scores = prev_scores + transitions + emission_score
+                
+                # Находим максимальный скор и соответствующий предыдущий тег
+                max_scores, max_indices = torch.max(scores, dim=0)
+                
+                viterbi_scores[t] = max_scores
+                backpointers[t] = max_indices
+
+            # Обратный проход (Backward Pass) - восстановление пути
+            path = [0] * sentence_len # Инициализируем путь нулями
+            
+            # Последний тег: находим тег с максимальным скором на последнем шаге
+            # Добавляем переходы к "END" состоянию
+            end_transitions = self.crf.state_dict()['end_trans']
+            final_scores = viterbi_scores[sentence_len - 1] + end_transitions
+            best_last_tag_id = torch.argmax(final_scores).item()
+            path[sentence_len - 1] = best_last_tag_id
+
+            # Восстанавливаем путь, используя backpointers
+            for t in range(sentence_len - 2, -1, -1):
+                path[t] = backpointers[t + 1, path[t + 1]].item()
+            
+            decoded_paths.append(path)
+        return decoded_paths
 
     def decode(self, sentence: torch.Tensor, mask: torch.Tensor) -> List[List[int]]:
         """
@@ -180,8 +323,8 @@ class BiLSTM_CRF(nn.Module):
             Список списков с предсказанными ID тегов для каждого предложения в батче.
         """
         lstm_features = self._get_lstm_features(sentence)
-        # CRF слой выполняет декодирование Витерби
-        decoded_tags = self.crf.decode(lstm_features, mask=mask)
+        # Используем ручную реализацию декодирования Витерби
+        decoded_tags = self._viterbi_decode_manual(lstm_features, mask)
         return decoded_tags
 
 
@@ -208,7 +351,7 @@ def train_lstm_crf_model(train_dataloader: DataLoader, val_dataloader: DataLoade
             model.zero_grad()
 
             # Прямой проход и расчет потерь (используем forward метод модели с CRF)
-            loss = model(tokens, tags, mask)
+            loss = model(tokens, tags, mask).mean() # Усредняем потери по батчу
 
             # Обратное распространение и оптимизация
             loss.backward()
@@ -225,7 +368,7 @@ def train_lstm_crf_model(train_dataloader: DataLoader, val_dataloader: DataLoade
         with torch.no_grad():
              for tokens, tags, mask in val_dataloader:
                 tokens, tags, mask = tokens.to(device), tags.to(device), mask.to(device)
-                loss = model(tokens, tags, mask)
+                loss = model(tokens, tags, mask).mean() # Усредняем потери по батчу
                 val_loss += loss.item()
         avg_val_loss = val_loss / len(val_dataloader)
         print(f"Epoch {epoch+1}/{num_epochs}, Val Loss: {avg_val_loss:.4f}")
