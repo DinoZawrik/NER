@@ -11,6 +11,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple
+from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
+import joblib # Для сохранения CRF модели
 
 # Добавляем путь к site-packages текущего окружения Conda
 # Это может быть необходимо, если Python не находит установленные пакеты
@@ -18,68 +20,66 @@ conda_env_path = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'sit
 if conda_env_path not in sys.path:
     sys.path.insert(0, conda_env_path)
 
-# Импорты для CRF и трансформеров будут добавлены позже
-# Импорты для CRF и трансформеров будут добавлены позже
-# import sklearn_crfsuite
-# import nltk
-# # nltk.download('punkt')
-# # nltk.download('averaged_perceptron_tagger')
+import sklearn_crfsuite
+import nltk
+# nltk.download('punkt')
+# nltk.download('averaged_perceptron_tagger')
 
 # Для CRF слоя будем использовать готовую реализацию
 # Убедитесь, что у вас установлена библиотека torchcrf: pip install torchcrf
 from TorchCRF import CRF
 
-# def word2features(sent, i):
-#     word = sent['tokens'][i]
-#     postag = nltk.pos_tag([word])[0][1]
+def word2features(sent, i):
+    word = sent['tokens'][i]
+    postag = nltk.pos_tag([word])[0][1]
 
-#     features = {
-#         'bias': 1.0,
-#         'word.lower()': word.lower(),
-#         'word[-3:]': word[-3:],
-#         'word[-2:]': word[-2:],
-#         'word.isupper()': word.isupper(),
-#         'word.istitle()': word.istitle(),
-#         'word.isdigit()': word.isdigit(),
-#         'postag': postag,
-#         'postag[:2]': postag[:2],
-#     }
-#     if i > 0:
-#         word1 = sent['tokens'][i-1]
-#         postag1 = nltk.pos_tag([word1])[0][1]
-#         features.update({
-#             '-1:word.lower()': word1.lower(),
-#             '-1:word.istitle()': word1.istitle(),
-#             '-1:word.isupper()': word1.isupper(),
-#             '-1:postag': postag1,
-#             '-1:postag[:2]': postag1[:2],
-#         })
-#     else:
-#         features['BOS'] = True
+    features = {
+        'bias': 1.0,
+        'word.lower()': word.lower(),
+        'word[-3:]': word[-3:],
+        'word[-2:]': word[-2:],
+        'word.isupper()': word.isupper(),
+        'word.istitle()': word.istitle(),
+        'word.isdigit()': word.isdigit(),
+        'postag': postag,
+        'postag[:2]': postag[:2],
+    }
+    if i > 0:
+        word1 = sent['tokens'][i-1]
+        postag1 = nltk.pos_tag([word1])[0][1]
+        features.update({
+            '-1:word.lower()': word1.lower(),
+            '-1:word.istitle()': word1.istitle(),
+            '-1:word.isupper()': word1.isupper(),
+            '-1:postag': postag1,
+            '-1:postag[:2]': postag1[:2],
+        })
+    else:
+        features['BOS'] = True
 
-#     if i < len(sent['tokens'])-1:
-#         word1 = sent['tokens'][i+1]
-#         postag1 = nltk.pos_tag([word1])[0][1]
-#         features.update({
-#             '+1:word.lower()': word1.lower(),
-#             '+1:word.istitle()': word1.istitle(),
-#             '+1:word.isupper()': word1.isupper(),
-#             '+1:postag': postag1,
-#             '+1:postag[:2]': postag1[:2],
-#         })
-#     else:
-#         features['EOS'] = True
+    if i < len(sent['tokens'])-1:
+        word1 = sent['tokens'][i+1]
+        postag1 = nltk.pos_tag([word1])[0][1]
+        features.update({
+            '+1:word.lower()': word1.lower(),
+            '+1:word.istitle()': word1.istitle(),
+            '+1:word.isupper()': word1.isupper(),
+            '+1:postag': postag1,
+            '+1:postag[:2]': postag1[:2],
+        })
+    else:
+        features['EOS'] = True
 
-#     return features
+    return features
 
-# def sent2features(sent):
-#     return [word2features(sent, i) for i in range(len(sent['tokens']))]
+def sent2features(sent):
+    return [word2features(sent, i) for i in range(len(sent['tokens']))]
 
-# def sent2labels(sent):
-#     return [tag for tag in sent['ner_tags']]
+def sent2labels(sent):
+    return [tag for tag in sent['ner_tags']]
 
-# def sent2tokens(sent):
-#     return [token for token in sent['tokens']]
+def sent2tokens(sent):
+    return [token for token in sent['tokens']]
 
 # --- Конфигурация ---
 TRAIN_FILE = 'data/eng.train'
@@ -376,6 +376,8 @@ def train_lstm_crf_model(train_dataloader: DataLoader, val_dataloader: DataLoade
     print("Обучение завершено.")
     return model
 
+from seqeval.metrics import precision_score, recall_score, f1_score, classification_report
+
 def evaluate_model(model: BiLSTM_CRF, dataloader: DataLoader, id_to_tag_map: dict, device: torch.device) -> Tuple[List[List[str]], List[List[str]]]:
     """
     Оценивает производительность модели на данных.
@@ -402,13 +404,43 @@ def evaluate_model(model: BiLSTM_CRF, dataloader: DataLoader, id_to_tag_map: dic
                 predictions.append(sentence_predictions)
                 true_labels.append(sentence_true_labels)
 
-    # Расчет метрик NER (требуется библиотека seqeval)
-    # from seqeval.metrics import precision_score, recall_score, f1_score, classification_report
-    # print(classification_report(true_labels, predictions))
+    # Расчет метрик NER
+    print("\nОтчет по классификации Bi-LSTM-CRF:")
+    print(classification_report(true_labels, predictions))
 
-    print("Оценка завершена (требуется seqeval для полного отчета).")
+    print("Оценка завершена.")
     # Возвращаем предсказания и истинные метки для дальнейшего анализа
     return true_labels, predictions
+
+def train_crf_model(train_data: List[dict], test_data: List[dict], tag_to_id_map: dict):
+    """
+    Обучение и оценка классической CRF модели.
+    """
+    print("Обучение классической CRF модели...")
+    X_train = [sent2features(s) for s in train_data]
+    y_train = [sent2labels(s) for s in train_data]
+
+    X_test = [sent2features(s) for s in test_data]
+    y_test = [sent2labels(s) for s in test_data]
+
+    crf = sklearn_crfsuite.CRF(
+        algorithm='lbfgs',
+        c1=0.1,
+        c2=0.1,
+        max_iterations=100,
+        all_possible_transitions=True
+    )
+    crf.fit(X_train, y_train)
+
+    print("Обучение CRF завершено.")
+
+    print("\nОценка CRF модели...")
+    y_pred = crf.predict(X_test)
+
+    print("\nОтчет по классификации CRF:")
+    print(classification_report(y_test, y_pred))
+    print("Оценка CRF завершена.")
+    return crf, y_test, y_pred
 
 
 # --- Сравнение результатов ---
@@ -417,7 +449,7 @@ def compare_results(results):
     """
     Сравнивает результаты оценки различных моделей.
     """
-    print("Сравнение результатов (заглушка)...")
+    print("Сравнение результатов...")
     # Здесь будет код для вывода сводной таблицы или графиков сравнения метрик
     # print(pd.DataFrame(results))
     pass
@@ -430,6 +462,8 @@ if __name__ == "__main__":
 
     # 2. Построение словаря и преобразование в ID
     token_to_id, id_to_token, vocab = build_vocab(train_data_raw)
+    
+    # Для Bi-LSTM-CRF
     train_token_ids = tokens_to_ids(train_data_raw, token_to_id)
     val_token_ids = tokens_to_ids(val_data_raw, token_to_id)
     test_token_ids = tokens_to_ids(test_data_raw, token_to_id)
@@ -438,42 +472,59 @@ if __name__ == "__main__":
     val_tag_ids = tags_to_ids(val_data_raw, TAG_TO_ID)
     test_tag_ids = tags_to_ids(test_data_raw, TAG_TO_ID)
 
-    # 3. Подготовка DataLoader
-    BATCH_SIZE = 32
-    train_dataset = NERDataset(train_token_ids, train_tag_ids)
-    val_dataset = NERDataset(val_token_ids, val_tag_ids)
-    test_dataset = NERDataset(test_token_ids, test_tag_ids)
+    # 3. Подготовка DataLoader для Bi-LSTM-CRF
+    BATCH_SIZE_LSTM = 32
+    train_dataset_lstm = NERDataset(train_token_ids, train_tag_ids)
+    val_dataset_lstm = NERDataset(val_token_ids, val_tag_ids)
+    test_dataset_lstm = NERDataset(test_token_ids, test_tag_ids)
 
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-    test_dataloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    train_dataloader_lstm = DataLoader(train_dataset_lstm, batch_size=BATCH_SIZE_LSTM, shuffle=True, collate_fn=collate_fn)
+    val_dataloader_lstm = DataLoader(val_dataset_lstm, batch_size=BATCH_SIZE_LSTM, shuffle=False, collate_fn=collate_fn)
+    test_dataloader_lstm = DataLoader(test_dataset_lstm, batch_size=BATCH_SIZE_LSTM, shuffle=False, collate_fn=collate_fn)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Используется устройство: {device}")
 
     # 4. Реализация и обучение модели Bi-LSTM-CRF
     # Параметры модели (можно экспериментировать)
     EMBEDDING_DIM = 100
     HIDDEN_DIM = 256
-    NUM_EPOCHS = 5 # Уменьшено для примера, в ВКР может потребоваться больше
-    LEARNING_RATE = 0.005
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Используется устройство: {device}")
+    NUM_EPOCHS_LSTM = 5 # Уменьшено для примера, в ВКР может потребоваться больше
+    LEARNING_RATE_LSTM = 0.005
 
     lstm_crf_model = train_lstm_crf_model(
-        train_dataloader,
-        val_dataloader,
+        train_dataloader_lstm,
+        val_dataloader_lstm,
         len(vocab),
         TAG_TO_ID,
         EMBEDDING_DIM,
         HIDDEN_DIM,
-        NUM_EPOCHS,
-        LEARNING_RATE
+        NUM_EPOCHS_LSTM,
+        LEARNING_RATE_LSTM
     )
 
-    # 5. Оценка модели
-    true_labels, predictions = evaluate_model(lstm_crf_model, test_dataloader, ID_TO_TAG, device)
+    # Сохранение модели Bi-LSTM-CRF
+    torch.save(lstm_crf_model.state_dict(), 'bilstm_crf_model.pth')
+    print("Модель Bi-LSTM-CRF сохранена в bilstm_crf_model.pth")
 
-    # 6. Сравнение результатов (пока только для одной модели)
-    # Для полного сравнения потребуется реализовать другие модели и собрать их результаты
+    # 5. Оценка модели Bi-LSTM-CRF
+    print("\n--- Оценка Bi-LSTM-CRF ---")
+    lstm_crf_true_labels, lstm_crf_predictions = evaluate_model(lstm_crf_model, test_dataloader_lstm, ID_TO_TAG, device)
 
-    print("\\nРеализация Bi-LSTM-CRF завершена. Выполните скрипт для обучения и оценки.")
-    print("Для полной оценки установите библиотеку seqeval: pip install seqeval")
+    # 6. Реализация и обучение классической CRF модели
+    print("\n--- Обучение и оценка CRF ---")
+    crf_model, crf_true_labels, crf_predictions = train_crf_model(train_data_raw, test_data_raw, TAG_TO_ID)
+
+    # Сохранение CRF модели
+    joblib.dump(crf_model, 'crf_model.pkl')
+    print("Модель CRF сохранена в crf_model.pkl")
+
+    # 9. Сравнение результатов
+    print("\n--- Сводка результатов ---")
+    results_summary = {
+        "Bi-LSTM-CRF": f1_score(lstm_crf_true_labels, lstm_crf_predictions, average='weighted'),
+        "CRF": f1_score(crf_true_labels, crf_predictions, average='weighted')
+    }
+    print(pd.DataFrame.from_dict(results_summary, orient='index', columns=['F1-score']))
+
+    print("\nРеализация всех моделей завершена. Выполните скрипт для обучения и оценки.")
