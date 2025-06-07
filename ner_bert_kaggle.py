@@ -5,6 +5,24 @@ from typing import List, Tuple
 from transformers import TFBertForTokenClassification, BertTokenizerFast, create_optimizer
 import tensorflow as tf
 
+# Проверка доступности GPU
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Установка стратегии распределения для использования всех доступных GPU
+        # Если у вас несколько GPU, это распределит обучение между ними
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Обнаружено GPU: {len(gpus)}. Используется стратегия MirroredStrategy.")
+        # Весь код обучения модели должен быть внутри этого блока
+        # (модель, оптимизатор, компиляция и fit)
+    except RuntimeError as e:
+        print(f"Ошибка при настройке GPU: {e}")
+        print("Обучение будет продолжено на CPU.")
+        strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0") # Fallback на CPU
+else:
+    print("GPU не обнаружен. Обучение будет продолжено на CPU.")
+    strategy = tf.distribute.OneDeviceStrategy(device="/cpu:0") # Явно указываем CPU
+
 # --- Конфигурация ---
 TRAIN_FILE = 'data/eng.train'
 VAL_FILE = 'data/eng.testa' # Используется как валидационная выборка
@@ -104,44 +122,46 @@ def train_bert_model(train_data_raw: List[dict], val_data_raw: List[dict], test_
     Обучение модели BERT для задачи NER.
     """
     print("Обучение модели BERT...")
-    tokenizer = BertTokenizerFast.from_pretrained('bert-base-cased')
-    model = TFBertForTokenClassification.from_pretrained('bert-base-cased', num_labels=len(tag_to_id_map))
 
-    # Токенизация и выравнивание меток
-    train_encoded = tokenize_and_align_labels_bert(train_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
-    val_encoded = tokenize_and_align_labels_bert(val_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
-    test_encoded = tokenize_and_align_labels_bert(test_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
+    with strategy.scope():
+        tokenizer = BertTokenizerFast.from_pretrained('bert-base-cased')
+        model = TFBertForTokenClassification.from_pretrained('bert-base-cased', num_labels=len(tag_to_id_map))
 
-    # Создание TensorFlow Datasets
-    train_dataset_bert = tf.data.Dataset.from_tensor_slices((
-        dict(train_encoded),
-        train_encoded["labels"]
-    )).batch(batch_size)
+        # Токенизация и выравнивание меток
+        train_encoded = tokenize_and_align_labels_bert(train_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
+        val_encoded = tokenize_and_align_labels_bert(val_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
+        test_encoded = tokenize_and_align_labels_bert(test_data_raw, tokenizer, MAX_SEQ_LENGTH, tag_to_id_map, id_to_tag_map)
 
-    val_dataset_bert = tf.data.Dataset.from_tensor_slices((
-        dict(val_encoded),
-        val_encoded["labels"]
-    )).batch(batch_size)
+        # Создание TensorFlow Datasets
+        train_dataset_bert = tf.data.Dataset.from_tensor_slices((
+            dict(train_encoded),
+            train_encoded["labels"]
+        )).batch(batch_size)
 
-    test_dataset_bert = tf.data.Dataset.from_tensor_slices((
-        dict(test_encoded),
-        test_encoded["labels"]
-    )).batch(batch_size)
+        val_dataset_bert = tf.data.Dataset.from_tensor_slices((
+            dict(val_encoded),
+            val_encoded["labels"]
+        )).batch(batch_size)
 
-    # Компиляция модели
-    optimizer, schedule = create_optimizer(
-        init_lr=learning_rate,
-        num_warmup_steps=0,
-        num_train_steps=len(train_dataset_bert) * num_epochs,
-        weight_decay_rate=0.01,
-        adam_beta1=0.9,
-        adam_beta2=0.999,
-        adam_epsilon=1e-6
-    )
-    model.compile(optimizer=optimizer, loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+        test_dataset_bert = tf.data.Dataset.from_tensor_slices((
+            dict(test_encoded),
+            test_encoded["labels"]
+        )).batch(batch_size)
 
-    # Обучение модели
-    model.fit(train_dataset_bert, epochs=num_epochs, validation_data=val_dataset_bert)
+        # Компиляция модели
+        optimizer, schedule = create_optimizer(
+            init_lr=learning_rate,
+            num_warmup_steps=0,
+            num_train_steps=len(train_dataset_bert) * num_epochs,
+            weight_decay_rate=0.01,
+            adam_beta1=0.9,
+            adam_beta2=0.999,
+            adam_epsilon=1e-6
+        )
+        model.compile(optimizer=optimizer, loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True))
+
+        # Обучение модели
+        model.fit(train_dataset_bert, epochs=num_epochs, validation_data=val_dataset_bert)
 
     print("Обучение BERT завершено.")
     return model, test_dataset_bert
