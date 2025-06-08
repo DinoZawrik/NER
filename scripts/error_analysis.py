@@ -1,265 +1,25 @@
 import sys
-import os
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from typing import List, Tuple
-import joblib
 import tensorflow as tf
+import joblib
 from transformers import BertTokenizerFast, TFBertForTokenClassification
-from collections import Counter
+from typing import List, Tuple
+
+# Импортируем общие утилиты и классы
+from scripts.utils import (
+    TRAIN_FILE, TEST_FILE,
+    NER_TAG_NAMES, TAG_TO_ID, ID_TO_TAG, PAD_TOKEN, UNK_TOKEN, PAD_TAG_ID, MAX_SEQ_LENGTH,
+    parse_conll_file, build_vocab, tokens_to_ids, tags_to_ids, add_tag_ids_to_sentences,
+    NERDataset, collate_fn, BiLSTM_CRF,
+    sent2features, sent2labels,
+    CONDA_ENV_PATH
+)
 
 # Добавляем путь к site-packages текущего окружения Conda
-conda_env_path = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'site-packages')
-if conda_env_path not in sys.path:
-    sys.path.insert(0, conda_env_path)
+if CONDA_ENV_PATH not in sys.path:
+    sys.path.insert(0, CONDA_ENV_PATH)
 
-import sklearn_crfsuite
-import nltk
-# nltk.download('punkt')
-# nltk.download('averaged_perceptron_tagger')
-from TorchCRF import CRF
-
-# --- Конфигурация и словари из ner_model_comparison.py ---
-TRAIN_FILE = 'data/eng.train'
-TEST_FILE = 'data/eng.testb'
-
-NER_TAG_NAMES = ['O', 'B-PER', 'I-PER', 'B-ORG', 'I-ORG', 'B-LOC', 'I-LOC', 'B-MISC', 'I-MISC']
-TAG_TO_ID = {tag: i for i, tag in enumerate(NER_TAG_NAMES)}
-ID_TO_TAG = {i: tag for tag, i in TAG_TO_ID.items()}
-PAD_TOKEN = "[PAD]"
-UNK_TOKEN = "[UNK]"
-PAD_TAG_ID = TAG_TO_ID['O']
-
-# --- Функции из ner_model_comparison.py ---
-
-def parse_conll_file(filepath: str) -> List[dict]:
-    sentences = []
-    tokens = []
-    ner_tags = []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                if tokens:
-                    sentences.append({'tokens': tokens, 'ner_tags': ner_tags})
-                tokens = []
-                ner_tags = []
-            else:
-                parts = line.split()
-                if len(parts) >= 4:
-                    tokens.append(parts[0])
-                    ner_tags.append(parts[3])
-    if tokens:
-        sentences.append({'tokens': tokens, 'ner_tags': ner_tags})
-    return sentences
-
-def build_vocab(sentences: List[dict], min_freq: int = 1) -> Tuple[dict, dict, list]:
-    token_counts = Counter(token for sentence in sentences for token in sentence['tokens'])
-    vocab = [token for token, count in token_counts.items() if count >= min_freq]
-    vocab = [PAD_TOKEN, UNK_TOKEN] + sorted(vocab)
-    token_to_id = {token: i for i, token in enumerate(vocab)}
-    id_to_token = {i: token for token, i in token_to_id.items()}
-    return token_to_id, id_to_token, vocab
-
-def tokens_to_ids(sentences: List[dict], token_to_id_map: dict) -> List[List[int]]:
-    token_ids_sentences = []
-    for sentence in sentences:
-        token_ids = [token_to_id_map.get(token, token_to_id_map[UNK_TOKEN]) for token in sentence['tokens']]
-        token_ids_sentences.append(token_ids)
-    return token_ids_sentences
-
-def tags_to_ids(sentences: List[dict], tag_to_id_map: dict) -> List[List[int]]:
-    ner_tags_ids_sentences = []
-    for sentence in sentences:
-        ner_tags_ids = [tag_to_id_map.get(tag, tag_to_id_map['O']) for tag in sentence['ner_tags']]
-        ner_tags_ids_sentences.append(ner_tags_ids)
-    return ner_tags_ids_sentences
-
-class NERDataset(Dataset):
-    def __init__(self, token_ids: List[List[int]], ner_tags_ids: List[List[int]]):
-        self.token_ids = token_ids
-        self.ner_tags_ids = ner_tags_ids
-
-    def __len__(self) -> int:
-        return len(self.token_ids)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return torch.tensor(self.token_ids[idx], dtype=torch.long), torch.tensor(self.ner_tags_ids[idx], dtype=torch.long)
-
-def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens, tags = zip(*batch)
-    tokens_padded = pad_sequence(tokens, batch_first=True, padding_value=token_to_id[PAD_TOKEN])
-    tags_padded = pad_sequence(tags, batch_first=True, padding_value=PAD_TAG_ID)
-    attention_mask = (tokens_padded != token_to_id[PAD_TOKEN]).bool()
-    return tokens_padded, tags_padded, attention_mask
-
-class BiLSTM_CRF(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_tags: int, dropout_rate: float = 0.1):
-        super(BiLSTM_CRF, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.vocab_size = vocab_size
-        self.num_tags = num_tags
-
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=token_to_id[PAD_TOKEN])
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim // 2, num_layers=1, bidirectional=True, batch_first=True)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.hidden2tag = nn.Linear(hidden_dim, num_tags)
-        self.crf = CRF(num_tags)
-
-    def _get_lstm_features(self, sentence: torch.Tensor) -> torch.Tensor:
-        embeds = self.embedding(sentence)
-        embeds = self.dropout(embeds)
-        lstm_out, _ = self.lstm(embeds)
-        lstm_out = self.dropout(lstm_out)
-        lstm_features = self.hidden2tag(lstm_out)
-        return lstm_features
-
-    def _viterbi_decode_manual(self, feats: torch.Tensor, mask: torch.Tensor) -> List[List[int]]:
-        batch_size, seq_len, num_tags = feats.shape
-        decoded_paths = []
-
-        feats = feats.cpu()
-        mask = mask.cpu()
-
-        for i in range(batch_size):
-            sentence_feats = feats[i, mask[i]]
-            sentence_len = sentence_feats.shape[0]
-
-            if sentence_len == 0:
-                decoded_paths.append([])
-                continue
-
-            viterbi_scores = torch.full((sentence_len, num_tags), -1e10)
-            backpointers = torch.full((sentence_len, num_tags), -1, dtype=torch.long)
-
-            start_transitions = self.crf.state_dict()['start_trans']
-            viterbi_scores[0] = sentence_feats[0] + start_transitions
-
-            for t in range(1, sentence_len):
-                prev_scores = viterbi_scores[t-1].unsqueeze(1)
-                emission_score = sentence_feats[t].unsqueeze(0)
-                transitions = self.crf.state_dict()['trans_matrix']
-                scores = prev_scores + transitions + emission_score
-                
-                max_scores, max_indices = torch.max(scores, dim=0)
-                
-                viterbi_scores[t] = max_scores
-                backpointers[t] = max_indices
-
-            path = [0] * sentence_len
-            
-            end_transitions = self.crf.state_dict()['end_trans']
-            final_scores = viterbi_scores[sentence_len - 1] + end_transitions
-            best_last_tag_id = torch.argmax(final_scores).item()
-            path[sentence_len - 1] = best_last_tag_id
-
-            for t in range(sentence_len - 2, -1, -1):
-                path[t] = backpointers[t + 1, path[t + 1]].item()
-            
-            decoded_paths.append(path)
-        return decoded_paths
-
-    def decode(self, sentence: torch.Tensor, mask: torch.Tensor) -> List[List[int]]:
-        lstm_features = self._get_lstm_features(sentence)
-        decoded_tags = self._viterbi_decode_manual(lstm_features, mask)
-        return decoded_tags
-
-def word2features(sent, i):
-    word = sent['tokens'][i]
-    postag = nltk.pos_tag([word])[0][1]
-
-    features = {
-        'bias': 1.0,
-        'word.lower()': word.lower(),
-        'word[-3:]': word[-3:],
-        'word[-2:]': word[-2:],
-        'word.isupper()': word.isupper(),
-        'word.istitle()': word.istitle(),
-        'word.isdigit()': word.isdigit(),
-        'postag': postag,
-        'postag[:2]': postag[:2],
-    }
-    if i > 0:
-        word1 = sent['tokens'][i-1]
-        postag1 = nltk.pos_tag([word1])[0][1]
-        features.update({
-            '-1:word.lower()': word1.lower(),
-            '-1:word.istitle()': word1.istitle(),
-            '-1:word.isupper()': word1.isupper(),
-            '-1:postag': postag1,
-            '-1:postag[:2]': postag1[:2],
-        })
-    else:
-        features['BOS'] = True
-
-    if i < len(sent['tokens'])-1:
-        word1 = sent['tokens'][i+1]
-        postag1 = nltk.pos_tag([word1])[0][1]
-        features.update({
-            '+1:word.lower()': word1.lower(),
-            '+1:word.istitle()': word1.istitle(),
-            '+1:word.isupper()': word1.isupper(),
-            '+1:postag': postag1,
-            '+1:postag[:2]': postag1[:2],
-        })
-    else:
-        features['EOS'] = True
-
-    return features
-
-def sent2features(sent):
-    return [word2features(sent, i) for i in range(len(sent['tokens']))]
-
-def sent2labels(sent):
-    return [tag for tag in sent['ner_tags']]
-
-# --- Функции из ner_bert_kaggle.py ---
-MAX_SEQ_LENGTH = 128
-
-def tokenize_and_align_labels_bert(sentences: List[dict], tokenizer: BertTokenizerFast, max_length: int, tag_to_id: dict, id_to_tag: dict):
-    tokenized_inputs = tokenizer(
-        [s['tokens'] for s in sentences],
-        is_split_into_words=True,
-        padding='max_length',
-        truncation=True,
-        max_length=max_length,
-        return_overflowing_tokens=False,
-        return_offsets_mapping=False,
-        return_token_type_ids=False,
-        return_attention_mask=True,
-        return_tensors="tf"
-    )
-
-    labels = []
-    for i, sentence in enumerate(sentences):
-        word_ids = tokenized_inputs.word_ids(batch_index=i)
-        previous_word_idx = None
-        label_ids = []
-        for word_idx in word_ids:
-            if word_idx is None:
-                label_ids.append(PAD_TAG_ID)
-            elif word_idx != previous_word_idx:
-                label_ids.append(sentence['ner_tags_ids'][word_idx])
-            else:
-                tag_id = sentence['ner_tags_ids'][word_idx]
-                if id_to_tag[tag_id].startswith('B-'):
-                    i_tag = 'I-' + id_to_tag[tag_id][2:]
-                    label_ids.append(tag_to_id[i_tag])
-                else:
-                    label_ids.append(tag_id)
-            previous_word_idx = word_idx
-        labels.append(label_ids)
-
-    tokenized_inputs["labels"] = tf.constant(labels, dtype=tf.int64)
-    return tokenized_inputs
-
-def add_tag_ids_to_sentences(sentences: List[dict], tag_to_id_map: dict) -> List[dict]:
-    for sentence in sentences:
-        sentence['ner_tags_ids'] = [tag_to_id_map.get(tag, tag_to_id_map['O']) for tag in sentence['ner_tags']]
-    return sentences
+# --- Основная часть скрипта ---
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,7 +35,7 @@ if __name__ == "__main__":
     train_data_raw = parse_conll_file(TRAIN_FILE)
     print(f"Загружено предложений в тренировочной выборке: {len(train_data_raw)}")
 
-    # 2. Определение словарей (уже определены выше)
+    # 2. Определение словарей (уже определены выше в utils.py)
 
     # 3. Подготовка данных для Bi-LSTM-CRF
     print("Подготовка данных для Bi-LSTM-CRF...")
@@ -284,17 +44,24 @@ if __name__ == "__main__":
     test_tag_ids = tags_to_ids(test_data_raw, TAG_TO_ID)
 
     test_dataset_lstm = NERDataset(test_token_ids, test_tag_ids)
-    BATCH_SIZE_LSTM = 32 # Используем тот же размер батча, что и при обучении
-    test_dataloader_lstm = DataLoader(test_dataset_lstm, batch_size=BATCH_SIZE_LSTM, shuffle=False, collate_fn=collate_fn)
+    BATCH_SIZE_LSTM = 32  # Используем тот же размер батча, что и при обучении
+    test_dataloader_lstm = DataLoader(
+        test_dataset_lstm,
+        batch_size=BATCH_SIZE_LSTM,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, token_to_id[PAD_TOKEN], PAD_TAG_ID)
+    )
     print("Данные для Bi-LSTM-CRF подготовлены.")
 
     # 4. Подготовка данных для BERT
     print("Подготовка данных для BERT...")
     tokenizer_bert = BertTokenizerFast.from_pretrained('bert-base-cased')
     test_data_processed_bert = add_tag_ids_to_sentences(test_data_raw, TAG_TO_ID)
-    test_encoded_bert = tokenize_and_align_labels_bert(test_data_processed_bert, tokenizer_bert, MAX_SEQ_LENGTH, TAG_TO_ID, ID_TO_TAG)
+    test_encoded_bert = tokenize_and_align_labels_bert(
+        test_data_processed_bert, tokenizer_bert, MAX_SEQ_LENGTH, TAG_TO_ID, ID_TO_TAG
+    )
     
-    BATCH_SIZE_BERT = 16 # Используем тот же размер батча, что и при обучении
+    BATCH_SIZE_BERT = 16  # Используем тот же размер батча, что и при обучении
     test_dataset_bert = tf.data.Dataset.from_tensor_slices((
         dict(test_encoded_bert),
         test_encoded_bert["labels"]
@@ -309,7 +76,7 @@ if __name__ == "__main__":
     HIDDEN_DIM = 256
     NUM_TAGS = len(NER_TAG_NAMES)
     
-    lstm_crf_model = BiLSTM_CRF(len(vocab), EMBEDDING_DIM, HIDDEN_DIM, NUM_TAGS)
+    lstm_crf_model = BiLSTM_CRF(len(vocab), EMBEDDING_DIM, HIDDEN_DIM, NUM_TAGS, padding_idx=TAG_TO_ID[PAD_TOKEN])
     lstm_crf_model.load_state_dict(torch.load('bilstm_crf_model.pth', map_location=device))
     lstm_crf_model.to(device)
     lstm_crf_model.eval()
@@ -340,7 +107,11 @@ if __name__ == "__main__":
             lstm_crf_predictions_ids.extend(predicted_tag_ids_batch)
             
             for i in range(len(tags)):
-                sentence_true_labels = [tags[i, j].item() for j in range(tags.size(1)) if mask[i, j].item() == 1]
+                sentence_true_labels = [
+                    tags[i, j].item()
+                    for j in range(tags.size(1))
+                    if mask[i, j].item() == 1
+                ]
                 lstm_crf_true_labels_ids.append(sentence_true_labels)
 
     # Предсказания CRF
@@ -399,7 +170,7 @@ if __name__ == "__main__":
 
     for i in range(min_len):
         sentence_tokens = test_data_raw[i]['tokens']
-        true_tags = test_data_raw[i]['ner_tags'] # Истинные теги из исходных данных
+        true_tags = test_data_raw[i]['ner_tags']  # Истинные теги из исходных данных
 
         # Проверка длины предсказаний и истинных меток
         # Это важно, так как токенизация BERT может изменить количество токенов
