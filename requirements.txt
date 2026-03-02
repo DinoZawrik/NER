@@ -1,9 +1,15 @@
-pandas
 numpy
+pandas
 matplotlib
 seaborn
-sklearn-crfsuite
 nltk
+sklearn-crfsuite
+torch
+TorchCRF
+seqeval
+joblib
 tensorflow
 tensorflow-addons
 transformers
+jupyter
+notebook

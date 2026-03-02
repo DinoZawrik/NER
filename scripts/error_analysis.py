@@ -1,5 +1,5 @@
-import sys
 import torch
+from torch.utils.data import DataLoader
 import tensorflow as tf
 import joblib
 from transformers import BertTokenizerFast, TFBertForTokenClassification
@@ -12,12 +12,8 @@ from scripts.utils import (
     parse_conll_file, build_vocab, tokens_to_ids, tags_to_ids, add_tag_ids_to_sentences,
     NERDataset, collate_fn, BiLSTM_CRF,
     sent2features, sent2labels,
-    CONDA_ENV_PATH
+    tokenize_and_align_labels_bert,
 )
-
-# Добавляем путь к site-packages текущего окружения Conda
-if CONDA_ENV_PATH not in sys.path:
-    sys.path.insert(0, CONDA_ENV_PATH)
 
 # --- Основная часть скрипта ---
 

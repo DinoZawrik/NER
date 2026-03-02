@@ -7,14 +7,6 @@ from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple
 from collections import Counter
 import nltk
-# nltk.download('punkt') # Закомментировано, так как загрузка должна быть выполнена один раз
-# nltk.download('averaged_perceptron_tagger') # Закомментировано, так как загрузка должна быть выполнена один раз
-
-# Добавляем путь к site-packages текущего окружения Conda
-# Это может быть необходимо, если Python не находит установленные пакеты
-CONDA_ENV_PATH = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'site-packages')
-if CONDA_ENV_PATH not in sys.path:
-    sys.path.insert(0, CONDA_ENV_PATH)
 
 import sklearn_crfsuite
 from TorchCRF import CRF
